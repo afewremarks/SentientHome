@@ -2,8 +2,6 @@ SentientHome
 ============
 
 [![Build Status](https://travis-ci.org/fxstein/SentientHome.svg?branch=master)](https://travis-ci.org/fxstein/SentientHome)
-[![Code Climate](https://codeclimate.com/github/fxstein/SentientHome/badges/gpa.svg)](https://codeclimate.com/github/fxstein/SentientHome)
-[![Coverage Status](https://coveralls.io/repos/fxstein/SentientHome/badge.svg)](https://coveralls.io/r/fxstein/SentientHome)
 
 This is currently work in progress for a Sentient Home Automation project I am working on. It is still in its infancy and has not been packaged for easy deployment.
 
@@ -65,7 +63,7 @@ These are some of the main technologies and components of the Home Automation pr
     Google Finance - Realtime financials for stocks, indices and currencies
     INSTEON - Smart switches and dimmers, motion/water/power sensors
     ISY994 - Universal Devices INSTEON controller platform
-    NEST - Thermostats and Smoke Detectors (TBD)
+    NEST - Thermostats and Smoke Detectors
     Netatmo - Personal Climate and Weather modules.
     Philips Hue - Smart controlable lighting (TBD)
     Rainforest Eagle - Realtime Smartgrid Power Sensor

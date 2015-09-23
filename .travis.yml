@@ -3,10 +3,25 @@ python:
   - "3.4"
 install:
   - python setup.py
+  - pip install flake8
+before_script:
+  - "flake8 --show-source --max-line-length=80 --statistics --builtins=_ common engine feed plugins"
 script:
-  - python common/shconfig.py
+  - python common/shapp.py
   - python common/sheventhandler.py
   - python common/shutil.py
-  - python common/shregistry.py
   - python engine/restinterface.py
   - python engine/memorymanager.py
+  - python feed/feed.home.tracer.py --help
+  - python feed/feed.home.apcups.py --help
+  - python feed/feed.home.autelis.py --help
+  - python feed/feed.home.eagle.py --help
+  - python feed/feed.home.finance.py --help
+  - python feed/feed.home.isy.py --help
+  - python feed/feed.home.loadtest.py --help
+  - python feed/feed.home.nest.py --help
+  - python feed/feed.home.netatmo.py --help
+  - python feed/feed.home.sma.webbox.py --help
+  - python feed/feed.home.ubnt.mfi.py --help
+  - python feed/feed.home.usgs.earthquake.py --help
+  - python feed/feed.home.zillow.py --help

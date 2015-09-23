@@ -1,223 +1,244 @@
 #!/usr/local/bin/python3 -u
-__author__    = 'Oliver Ratzesberger <https://github.com/fxstein>'
+__author__ = 'Oliver Ratzesberger <https://github.com/fxstein>'
 __copyright__ = 'Copyright (C) 2015 Oliver Ratzesberger'
-__license__   = 'Apache License, Version 2.0'
+__license__ = 'Apache License, Version 2.0'
 
 # Make sure we have access to SentientHome commons
-import os, sys
-sys.path.append(os.path.dirname(os.path.abspath(__file__))  + '/..')
-
-# Sentient Home configuration
-from common.shconfig import shConfig
-config = shConfig('~/.config/home/home.cfg')
+import os
+import sys
+sys.path.append(os.path.dirname(os.path.abspath(__file__)) + '/..')
 
 import asyncio
-from aiohttp import web
 import json
 import time
-from collections import defaultdict, deque
+from aiohttp import web
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+
+# Sentient Home Application
+from common.shapp import shApp
+from cement.core.exc import CaughtSignal
 
 # Restful/JSON interface API for event engine
 from restinterface import shRestInterface
 # In memory data manager for processing and persitance
 from memorymanager import shMemoryManager
 
-# ISY helper
-sys.path.append(os.path.dirname(os.path.abspath(__file__))  + '/../dependencies/ISYlib-python')
-from ISY.IsyClass import Isy
+from cement.core import hook
 
 
-import logging as log
-log.info('Starting Sentient Home Event Engine')
+class shEventEngine(shApp):
+    class Meta:
+        label = 'sheventengine'
 
-@asyncio.coroutine
-def handle_event(request):
+        # Define hooks that plugins may implment to extend the event engine
+        define_hooks = ['event_state',
+                        'pre_process_event',
+                        'process_event',
+                        'post_process_event']
+
+        plugin_dirs = ['~/SentientHome/plugins',
+                       '~/SentientHome/rules']
+
+        plugin_config_dirs = ['~/SentientHome/plugins',
+                              '~/SentientHome/rules']
+
+    def setup(self):
+        # always run core setup first
+        super(shEventEngine, self).setup()
+
+        self.log.debug('setup()')
+
+        self._loop = asyncio.get_event_loop()
+
+        # Create a ThreadPool with 2 threads
+        self._thread = ThreadPoolExecutor(2)
+
+        hook.register('post_run', self._post_run, weight=-1)
+        hook.register('pre_close', self._pre_close, weight=-1)
+
+    def _post_run(self, app):
+        self.log.debug('_post_run()')
+
+        self._memory = shMemoryManager(self, self._loop)
+
+        self._loop.run_until_complete(self.init(self._loop))
+
+    def _pre_close(self, app):
+        self.log.debug('_pre_close()')
+
+        self._loop.run_until_complete(self.finish())
+
+    def _checkpoint(self):
+
+        app.log.debug('Checkpointing memory cache')
+
+        try:
+            self._loop.run_in_executor(self._thread, self._memory.checkpoint)
+        except Exception as e:
+            app.log.error('Unable to checkpoint memory cache')
+            app.log.error(e)
+
+        self._loop.call_later((int)(app.config.get('SentientHome',
+                                                   'checkpoint_interval',
+                                                   fallback=60)),
+                              self._checkpoint)
+
+    def run_forever(self):
+        self._loop.run_forever()
+
+    @asyncio.coroutine
+    def init(self, loop):
+        eaddr = self.config.get('SentientHome', 'event_addr')
+        eport = self.config.get('SentientHome', 'event_port')
+        epath = self.config.get('SentientHome', 'event_path')
+
+        eaddr = eaddr.replace('http://', '')
+
+        self._webapp = web.Application(loop=loop, logger=None)
+
+        # Handle incoming events
+        self._webapp.router.add_route('POST', epath, self.handle_event)
+
+        # Register and implement all other RESTful interfaces
+        # interface =
+        shRestInterface(self)
+
+        self._webapp_handler = self._webapp.make_handler()
+
+        try:
+            self._webapp_srv = yield from self._loop.create_server(
+                self._webapp_handler, eaddr, eport)
+
+            self.log.info("Event Engine started at http://%s:%s" %
+                          (eaddr, eport))
+
+            self._loop.call_later((int)(self.config.get('SentientHome',
+                                                        'checkpoint_interval',
+                                                        fallback=60)),
+                                  app._checkpoint)
+        except Exception as e:
+            self.log.fatal("Unable to start RESTful interface at http://%s:%s" %
+                           (eaddr, eport))
+            self.log.fatal(e)
+            self._loop.stop()
+
+    @asyncio.coroutine
+    def handle_event(self, request):
+        self.log.debug('shEventEngine handle_event')
+
+        try:
+            text = yield from request.text()
+            events = json.loads(text)
+
+            # Assemble individual events from incoming stream
+            #
+            for event in events:
+                self.log.debug('Event Type: %s' % event['name'])
+
+                # Initialize raw event cache if it does not exist yet
+                if not self._memory.raw[event['name']]:
+                    # TODO: Lookup cache size from config
+                    self._memory.raw[event['name']] = deque(maxlen=5000)
+
+                for p in event['points']:
+                    # Perform a simple sanity check
+                    if len(event['columns']) != len(p):
+                        self.log.error('Number of Columns %s mismatches number \
+                                        of Points %s' %
+                                       (len(event['columns']), len(p)))
+
+                    # Populate raw event memory
+                    raw = dict()
+
+                    # Carry forward initial timestamp from feed
+                    raw['shtime1'] = event['shtime1']
+                    # Timestamp the assembled event in milliseconds since epoch
+                    raw['shtime2'] = time.time()*1000
+                    for x in range(0, len(event['columns'])):
+                        raw[event['columns'][x]] = p[x]
+
+                    self.log.debug('raw event: %s' % raw)
+
+                    self._memory.raw[event['name']].appendleft(raw)
+
+                    # Enable plugins to define state/status caches specific to
+                    # one or more event types
+                    for res in hook.run('event_state', self, event['name'],
+                                        raw):
+                        pass
+
+                    # Enable pre event processing
+                    for res in hook.run('pre_process_event', self,
+                                        event['name'], raw):
+                        pass
+
+                    # Create a task to process event rule(s)
+                    # This allows us to quickly get back to the service call
+                    # while taking all the time we need to process the event
+                    # async
+                    self._loop.create_task(
+                        self.process_event(event['name'], raw))
+
+                    time3 = time.time()*1000
+
+                    # Report event latency
+                    self.log.info('Event Latency: %2.4sms' %
+                                  (raw['shtime2'] - raw['shtime1']))
+
+                    self.log.info('Event Processing Init Latency: %2.4sms' %
+                                  (time3 - raw['shtime1']))
+
+            output = {'msg': 'Event Received'}
+        except Exception as e:
+            app.log.error('Event Error: %s' % e)
+            output = {'msg': 'Event Error; Event Rejected'}
+
+        return web.Response(body=json.dumps(output).encode('utf-8'))
+
+    @asyncio.coroutine
+    def process_event(self, event_type, event):
+        self.log.debug('process_event() Event: %s %s' % (event_type, event))
+
+        # Enable plugins to define state/status caches specific to
+        # one or more event types
+        for res in hook.run('process_event', self, event_type, event):
+            pass
+
+        # Enable post event processing
+        for res in hook.run('post_process_event', self, event_type, event):
+            pass
+
+        time4 = time.time()*1000
+
+        # Report final event processing latency
+        self.log.info('Event Processing Final Latency: %2.4sms' %
+                      (time4 - event['shtime1']))
+
+    @asyncio.coroutine
+    def finish(self):
+        self.log.debug('shEventEngine finish')
+
+        self.log.info('Shuting down Event Engine...')
+        yield from asyncio.sleep(0.1)
+
+        if hasattr(self, '_webapp_srv'):
+            self._webapp_srv.close()
+            yield from self._webapp_handler.finish_connections()
+            yield from self._webapp_srv.wait_closed()
+
+        # Perform final inline checkpoint as we are shutting down after this
+        self._memory.checkpoint()
+        self.log.info('Good Bye!')
+
+
+with shEventEngine('shEventEngine') as app:
+    app.run()
+    app.log.info('Starting Sentient Home Event Engine')
 
     try:
-        text = yield from request.text()
-        event = json.loads(text)
+        app.run_forever()
+    except (KeyboardInterrupt, SystemExit, CaughtSignal):
+        app.log.info('Shutting down Sentient Home Event Engine')
 
-        # Assemble individual events from incoming stream
-        #
-        for e in event:
-            log.debug('Event Type: %s', e['name'], )
-
-            # Initialize raw event cache if it does not exist yet
-            if not memory.eventmemory['raw'][e['name']]:
-                # TODO: Lookup cache size from config
-                memory.eventmemory['raw'][e['name']] = deque(maxlen=5000)
-
-            # Initialize state event cache if it does not exist yet
-            if not memory.eventmemory['state'][e['name']]:
-                memory.eventmemory['state'][e['name']] = defaultdict(deque)
-
-            for p in e['points']:
-                # Perform a simple sanity check
-                if len(e['columns']) != len(p):
-                    log.error('Number of Columns %s mismatches number of Points %s',\
-                                len(e['columns']), len(p))
-
-                # Populate raw event memory
-                myevent = dict()
-
-                # Carry forward initial timestamp from feed
-                myevent['shtime1'] = e['shtime1']
-                # Timestamp the assembled event in milliseconds since epoch
-                myevent['shtime2'] = time.time()*1000
-                for x in range(0, len(e['columns'])):
-                    myevent[e['columns'][x]]=p[x]
-
-                log.debug('myevent: %s', myevent)
-
-                memory.eventmemory['raw'][e['name']].appendleft(myevent)
-
-                # Populate state memory
-                state = dict()
-                state['time'] = e['shtime1']
-
-                # Temporarily built isy status cache in here
-                # TODO: Move into a plugin
-
-                try:
-                    if e['name'] == 'isy':
-                        # Initialize state event cache if it does not exist yet
-                        if not memory.eventmemory['state'][e['name']][myevent['Event.node']]:
-                            memory.eventmemory['state'][e['name']][myevent['Event.node']] = deque(maxlen=100)
-
-                        state['control'] = myevent['Event.control']
-                        state['action'] = myevent['Event.action']
-
-                        actions = ['DON', 'DFON', 'DOF', 'DFOF', 'ST', 'OL', \
-                                   'RR', 'BMAN', 'SMAN', 'DIM', 'BRT']
-
-                        if state['control'] in actions:
-                            log.debug('==============================')
-                            log.debug('Node: %s Data: %s', myevent['Event.node'], state)
-                            log.debug('==============================')
-                            memory.eventmemory['state'][e['name']][myevent['Event.node']].appendleft(state)
-                except Exception as e:
-                    log.Error('Error appending state: %s', e)
-
-                # Fire event engine
-                yield from fire(e['name'], myevent, state, memory)
-
-                time3 = time.time()*1000
-
-                # Report event latency
-                log.info('Event Latency: %2.4sms',\
-                    myevent['shtime2']-myevent['shtime1'])
-
-                log.info('Event Processing Latency: %2.4sms',\
-                    time3-myevent['shtime1'])
-
-
-        output = {'msg' : 'Event Received'}
-    except Exception as e:
-        log.Error('Event Error: %s', e)
-        output = {'msg' : 'Event Error; Event Rejected'}
-
-    return web.Response(body=json.dumps(output).encode('utf-8'))
-
-@asyncio.coroutine
-def init(loop):
-    eaddr = config.get('sentienthome', 'event_addr')
-    eport = config.get('sentienthome', 'event_port')
-    epath = config.get('sentienthome', 'event_path')
-
-    app = web.Application(loop=loop, logger=None)
-
-    # Handle incoming events
-    app.router.add_route('POST', epath, handle_event)
-
-    memory = shMemoryManager(config, app, loop)
-
-    # Register and implement all other RESTful interfaces
-    interface = shRestInterface(config, app, memory);
-
-    handler = app.make_handler()
-
-    srv = yield from loop.create_server(handler, eaddr, eport)
-    log.info("Event Engine started at http://%s:%s", eaddr, eport)
-
-    return app, srv, handler, memory, interface
-
-@asyncio.coroutine
-def finish(app, srv, handler, memory):
-    log.info('Shuting down Event Engine...')
-    yield from asyncio.sleep(0.1)
-    srv.close()
-    yield from handler.finish_connections()
-    yield from srv.wait_closed()
-
-    # Perform final inline checkpoint as we are shutting down after this
-    memory.checkpoint()
-    log.info('Good Bye!')
-
-@asyncio.coroutine
-def checkpoint(loop, thread, memory):
-    try:
-        # TODO: Replace while loop with scheduled tasks...
-        while(True):
-            yield from loop.run_in_executor(thread, memory.checkpoint)
-            # TODO: Need to make the checkpoints configurable
-            yield from asyncio.sleep(120)
-    except Exception:
-        return
-
-@asyncio.coroutine
-def fire(etype, event, state, memory):
-    try:
-        log.debug('Firing event rules for: %s: %s, %s', etype, event, state)
-
-        # TODO: The logic below is a temporary test and to be placed into
-        # event engine plugins onve the kinks are worked out.
-
-        if etype == 'isy' and  event['Event.node'] == '24 0 93 1':
-            log.debug('!!!!!!!!!!FOUNTAIN!!!!!!!!!!!')
-        elif etype == 'isy' and  event['Event.node'] == '29 14 86 1':
-            log.debug('!!!!!!!!!!LIVING - WINDOW - OUTLET!!!!!!!!!!!')
-        elif etype == 'isy' and state['control'] == 'DON':
-            log.debug('Node: %s TURNED ON!!!!!!!!!!!!!!!!', node)
-        elif etype == 'isy' and state['control'] == 'ST':
-            log.debug('Node: %s SET TARGET!!!!!!!!!!!!!!!', node)
-            
-        # Test mFi Sensor rule
-        if etype == 'ubnt.mfi.sensor' and event['label'] == 'Well.Well.Pump':
-            if event['amps'] < 21 and event['amps'] > 15:
-                # Turn off the well pump for set amount of time
-                log.info('!!!!!!!! WELL PUMP SAVER ACTION !!!!!!!!!')
-
-                myIsy = Isy(addr=config.get('isy', 'isy_addr'),\
-                            userl=config.get('isy', 'isy_user'),\
-                            userp=config.get('isy', 'isy_pass'))
-                # First put pump to sleep
-                well_pump = myIsy.get_node("Well - Well Pump")
-                if well_pump:
-                    well_pump.off()
-                    # yield from asyncio.sleep(2)
-                    # well_pump.off()
-                    #
-                    # # Then schedule wakeup at a later time
-                    # yield from asyncio.sleep(900)
-                    # well_pump.on()
-                    # yield from asyncio.sleep(2)
-                    # well_pump.on()
-
-
-    except Exception:
-        return
-
-
-loop = asyncio.get_event_loop()
-app, srv, handler, memory, interface = loop.run_until_complete(init(loop))
-
-# Create a ThreadPool with 2 threads
-thread = ThreadPoolExecutor(2)
-# Create a task to perform ongoing checkpoints
-loop.create_task(checkpoint(loop, thread, memory))
-
-try:
-    loop.run_forever()
-except (KeyboardInterrupt, SystemExit):
-    loop.run_until_complete(finish(app, srv, handler, memory))
+        app.close()
